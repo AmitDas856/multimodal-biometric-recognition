@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+features/
+model/
+testImages/
+dataset/
+*.h5
+*.pckl
+*.npy
