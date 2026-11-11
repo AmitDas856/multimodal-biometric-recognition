@@ -1,269 +1,277 @@
-from tkinter import *
-import tkinter
-from tkinter import filedialog
-import matplotlib.pyplot as plt
- 
-from tkinter.filedialog import askopenfilename
-import numpy as np
-from sklearn.metrics import accuracy_score
-from sklearn.model_selection import train_test_split
-import os
-import cv2
+"""An Enhanced Multi-Modal Biometric Authentication (Tkinter + Keras).
 
-from keras.utils.np_utils import to_categorical
-from keras.layers import  MaxPooling2D
-from keras.layers import Dense, Dropout, Activation, Flatten
-from keras.layers import Convolution2D
-from keras.models import Sequential
-from keras.models import model_from_json
+Fuses face, fingerprint, iris, ear and palm images into one feature array and
+classifies the person with a small CNN. Bachelor's final-year project.
+
+The model and feature code can be imported without opening the GUI (see
+tests/); run `python Multimodal.py` to start the desktop app.
+"""
+import os
 import pickle
 
+import cv2
+import numpy as np
+from sklearn.model_selection import train_test_split
 
-main = tkinter.Tk()
-main.title("An Enhanced Multi-Modal Biometric Authentication")
-main.geometry("1200x1200")
+try:  # TensorFlow 2.x / Keras 3
+    from tensorflow.keras.layers import Conv2D, Dense, Flatten, Input, MaxPooling2D
+    from tensorflow.keras.models import Sequential, model_from_json
+    from tensorflow.keras.utils import to_categorical
+except ImportError:  # standalone Keras 3
+    from keras.layers import Conv2D, Dense, Flatten, Input, MaxPooling2D
+    from keras.models import Sequential, model_from_json
+    from keras.utils import to_categorical
 
-global X, Y, X_train, X_test, y_train, y_test
-global multimodal
-global filename
+IMAGE_SIZE = (64, 64)
+MODALITIES = ("face", "finger", "iris", "ear", "palm")
+FEATURES_DIR = "features"
+MODEL_DIR = "model"
+
+X = Y = X_train = X_test = y_train = y_test = None
+multimodal = None
+filename = None
+main = text = pathlabel = None  # created in build_gui()
 
 
+# ---------------------------------------------------------------------------
+# Feature extraction (no GUI needed)
+# ---------------------------------------------------------------------------
 def KLDAFilters():
+    """Bank of 16 Gabor kernels used to enhance fingerprint ridges."""
     filters = []
     ksize = 31
     for theta in np.arange(0, np.pi, np.pi / 16):
-        kern = cv2.getGaborKernel((ksize, ksize), 4.0, theta, 10.0, 0.5, 0, ktype=cv2.CV_32F) #getting Gabor features
-        kern /= 1.5*kern.sum()
+        kern = cv2.getGaborKernel((ksize, ksize), 4.0, theta, 10.0, 0.5, 0, ktype=cv2.CV_32F)
+        kern /= 1.5 * kern.sum()
         filters.append(kern)
     return filters
 
+
 def KLDAProcess(img, filters):
+    """Keep the strongest Gabor response at every pixel."""
     accum = np.zeros_like(img)
     for kern in filters:
         fimg = cv2.filter2D(img, cv2.CV_8UC3, kern)
         np.maximum(accum, fimg, accum)
     return accum
 
+
 klda_filter = KLDAFilters()
 
-def getTestFingerImage(path):
+
+def _read(path):
     img = cv2.imread(path)
-    img = cv2.resize(img, (64,64))
-    img = KLDAProcess(img,klda_filter)
-    return img
+    if img is None:
+        raise FileNotFoundError(f"Could not read image: {path}")
+    return cv2.resize(img, IMAGE_SIZE)
+
+
+def getTestFingerImage(path):
+    return KLDAProcess(_read(path), klda_filter)
+
 
 def getTestFaceImage(path):
-    img = cv2.imread(path)
-    img = cv2.resize(img, (64,64))
-    return img
+    return _read(path)
+
 
 def getTestIrisImage(path):
-    img = cv2.imread(path)
-    img = cv2.resize(img, (64,64))
-    return img
+    return _read(path)
+
 
 def getTestEarImage(path):
-    img = cv2.imread(path)
-    img = cv2.resize(img, (64,64))
-    return img
+    return _read(path)
+
 
 def getTestPalmImage(path):
-    img = cv2.imread(path)
-    img = cv2.resize(img, (64,64))
-    return img
-    
+    return _read(path)
+
+
+def fuse(face, finger, iris, ear, palm):
+    """Stack the five modality arrays into one input (feature-level fusion)."""
+    return np.hstack((face, finger, iris, ear, palm))
+
+
+def load_features(features_dir=FEATURES_DIR):
+    """Load the saved per-modality features and labels, fused into X and Y."""
+    arrays = {m: np.load(os.path.join(features_dir, f"{m}X.txt.npy")) for m in MODALITIES}
+    labels = np.load(os.path.join(features_dir, "faceY.txt.npy"))
+    return fuse(*(arrays[m] for m in MODALITIES)), labels
+
+
+def build_model(input_shape, n_classes):
+    """Two Conv2D + MaxPooling blocks, a 256-unit dense layer, softmax output."""
+    model = Sequential([
+        Input(shape=input_shape),
+        Conv2D(32, (3, 3), activation="relu"),
+        MaxPooling2D(pool_size=(2, 2)),
+        Conv2D(32, (3, 3), activation="relu"),
+        MaxPooling2D(pool_size=(2, 2)),
+        Flatten(),
+        Dense(256, activation="relu"),
+        Dense(n_classes, activation="softmax"),
+    ])
+    model.compile(optimizer="adam", loss="categorical_crossentropy", metrics=["accuracy"])
+    return model
+
+
+def history_accuracy(history):
+    """Training accuracy from a Keras history dict (old Keras used 'acc')."""
+    return history.get("accuracy", history.get("acc"))
+
+
+# ---------------------------------------------------------------------------
+# GUI actions
+# ---------------------------------------------------------------------------
 def uploadDataset():
     global filename
-    text.delete('1.0', END)
+    from tkinter import END, filedialog
+    text.delete("1.0", END)
     filename = filedialog.askdirectory(initialdir=".")
-    text.insert(END,str(filename)+" Dataset Loaded\n\n")
-    pathlabel.config(text=str(filename)+" Dataset Loaded\n\n")
+    text.insert(END, str(filename) + " Dataset Loaded\n\n")
+    pathlabel.config(text=str(filename) + " Dataset Loaded\n\n")
 
 
 def preprocessKLDAFeatures():
     global X, Y, X_train, X_test, y_train, y_test
-    text.delete('1.0', END)
-    #extract all features from different dataset images
-    faceX = np.load("features/faceX.txt.npy")
-    faceY = np.load("features/faceY.txt.npy")
-    fingerX = np.load("features/fingerX.txt.npy")
-    fingerY = np.load("features/fingerY.txt.npy")
-    irisX = np.load("features/irisX.txt.npy")
-    irisY = np.load("features/irisY.txt.npy")
-    earX = np.load("features/earX.txt.npy")
-    earY = np.load("features/earY.txt.npy")
-    palmX = np.load("features/palmX.txt.npy")
-    palmY = np.load("features/palmY.txt.npy")
-    X = np.hstack((faceX, fingerX, irisX, earX, palmX))#concatenate all features to single array
-    Y = faceY
-    print(X.shape)
+    from tkinter import END
+    text.delete("1.0", END)
+    X, Y = load_features()
     indices = np.arange(X.shape[0])
     np.random.shuffle(indices)
-    X = X[indices]
-    Y = Y[indices]
+    X, Y = X[indices], Y[indices]
     Y = to_categorical(Y)
-    text.insert(END,"Preprocessing & KLDA Features extraction process completed\n\n")
-    text.insert(END,"Total images found in dataset : 600\n\n")
     X_train, X_test, y_train, y_test = train_test_split(X, Y, test_size=0.2)
-    text.insert(END,"Dataset train and test split details\n\n")
-    text.insert(END,"Total 80% images used for training : 480\n")
-    text.insert(END,"Total 20% images used for training : 120\n")
+    text.insert(END, "Preprocessing & KLDA Features extraction process completed\n\n")
+    text.insert(END, f"Total images found in dataset : {X.shape[0]}\n\n")
+    text.insert(END, "Dataset train and test split details\n\n")
+    text.insert(END, f"Total 80% images used for training : {X_train.shape[0]}\n")
+    text.insert(END, f"Total 20% images used for testing : {X_test.shape[0]}\n")
+
+
+def _load_saved_model():
+    with open(os.path.join(MODEL_DIR, "multimodal_model.json"), "r") as json_file:
+        model = model_from_json(json_file.read())
+    for name in ("multimodal.weights.h5", "multimodal_weights.h5"):  # new, then old Keras name
+        path = os.path.join(MODEL_DIR, name)
+        if os.path.exists(path):
+            model.load_weights(path)
+            return model
+    raise FileNotFoundError("No saved weights in " + MODEL_DIR)
+
 
 def trainModel():
-    text.delete('1.0', END)
-    global X, Y, multimodal, X_train, X_test, y_train, y_test
-    if os.path.exists("model/multimodal_model.json"):
-        with open('model/multimodal_model.json', "r") as json_file:
-            loaded_model_json = json_file.read()
-            multimodal = model_from_json(loaded_model_json)
-        json_file.close()
-        multimodal.load_weights("model/multimodal_weights.h5")
-        multimodal._make_predict_function()
-    else:
-        multimodal = Sequential()
-        multimodal.add(Convolution2D(32, 3, 3, input_shape = (X.shape[1], X.shape[2], X.shape[3]), activation = 'relu'))
-        multimodal.add(MaxPooling2D(pool_size = (2, 2)))
-        multimodal.add(Convolution2D(32, 3, 3, activation = 'relu'))
-        multimodal.add(MaxPooling2D(pool_size = (2, 2)))
-        multimodal.add(Flatten())
-        multimodal.add(Dense(output_dim = 256, activation = 'relu'))
-        multimodal.add(Dense(output_dim = Y.shape[1], activation = 'softmax'))
-        multimodal.compile(optimizer = 'adam', loss = 'categorical_crossentropy', metrics = ['accuracy'])
-        hist =  multimodal.fit(X_train, y_train, batch_size=16, epochs=10, shuffle=True, verbose=2, validation_data=(X_test, y_test))
-        multimodal.save_weights('model/multimodal_weights.h5')            
-        model_json = multimodal.to_json()
-        with open("model/multimodal_model.json", "w") as json_file:
-            json_file.write(model_json)
-        json_file.close()
-        f = open('model/multimodal_history.pckl', 'wb')
-        pickle.dump(hist.history, f)
-        f.close()
-    print(multimodal.summary())
-    f = open('model/multimodal_history.pckl', 'rb')
-    cnn_data = pickle.load(f)
-    f.close()
-    print(cnn_data['acc'])
-    accuracy = cnn_data['acc'][3]
-    text.insert(END,"Multimodal training accuracy : "+str(accuracy))         
+    global multimodal
+    from tkinter import END
+    text.delete("1.0", END)
+    if X is None:
+        text.insert(END, "Run 'Preprocess & KLDA Features Extraction' first.\n")
+        return
+    history_path = os.path.join(MODEL_DIR, "multimodal_history.pckl")
+    multimodal = None
+    if os.path.exists(os.path.join(MODEL_DIR, "multimodal_model.json")):
+        try:
+            multimodal = _load_saved_model()
+        except Exception as exc:  # weights saved by an older Keras version
+            print("Saved model could not be loaded, retraining:", exc)
+    if multimodal is None:
+        os.makedirs(MODEL_DIR, exist_ok=True)
+        multimodal = build_model(X.shape[1:], Y.shape[1])
+        hist = multimodal.fit(X_train, y_train, batch_size=16, epochs=10, shuffle=True,
+                              verbose=2, validation_data=(X_test, y_test))
+        multimodal.save_weights(os.path.join(MODEL_DIR, "multimodal.weights.h5"))
+        with open(os.path.join(MODEL_DIR, "multimodal_model.json"), "w") as json_file:
+            json_file.write(multimodal.to_json())
+        with open(history_path, "wb") as f:
+            pickle.dump(hist.history, f)
+    multimodal.summary()
+    with open(history_path, "rb") as f:
+        accuracy = history_accuracy(pickle.load(f))
+    text.insert(END, "Multimodal training accuracy : " + str(accuracy[-1]))
 
 
 def graph():
-    f = open('model/multimodal_history.pckl', 'rb')
-    cnn_data = pickle.load(f)
-    f.close()
-    accuracy = cnn_data['acc']
-    loss = cnn_data['loss']
-    plt.figure(figsize=(10,6))
+    import matplotlib.pyplot as plt
+    with open(os.path.join(MODEL_DIR, "multimodal_history.pckl"), "rb") as f:
+        cnn_data = pickle.load(f)
+    plt.figure(figsize=(10, 6))
     plt.grid(True)
-    plt.xlabel('Iterations/Epoch')
-    plt.ylabel('Accuracy')
-    plt.plot(accuracy, 'ro-', color = 'green')
-    plt.plot(loss, 'ro-', color = 'orange')
-    plt.legend(['Multimodal Training Accuracy', 'Multimodal Training Loss'], loc='upper left')
-    plt.title('Deep Learning Multimodal Accuracy & Loss Comparison Graph')
+    plt.xlabel("Iterations/Epoch")
+    plt.ylabel("Accuracy")
+    plt.plot(history_accuracy(cnn_data), "o-", color="green")
+    plt.plot(cnn_data["loss"], "o-", color="orange")
+    plt.legend(["Multimodal Training Accuracy", "Multimodal Training Loss"], loc="upper left")
+    plt.title("Deep Learning Multimodal Accuracy & Loss Comparison Graph")
     plt.show()
 
 
 def authentication():
-    global multimodal
-    filename = filedialog.askdirectory(initialdir="testImages")
-    finger = getTestFingerImage(filename+'/finger.jpg')
-    face = getTestFaceImage(filename+'/face.jpg')
-    iris = getTestIrisImage(filename+'/iris.jpg')
-    ear = getTestEarImage(filename+'/ear.jpg')
-    palm = getTestEarImage(filename+'/palm.jpg')
-    fin = []
-    fin.append(finger)
-    fa = []
-    fa.append(face)
-    fa = np.asarray(fa)
-    fin = np.asarray(fin)
-    ir = []
-    ir.append(iris)
-    ir = np.asarray(ir)
-    ea = []
-    ea.append(ear)
-    ea = np.asarray(ea)
-    pa = []
-    pa.append(palm)
-    pa = np.asarray(pa)
-    test = np.hstack((fa, fin, ir, ea, pa))
-    test = test.astype('float32')
-    test = test/255
-    print(test.shape)
-    predict = multimodal.predict(test)
-    predict = np.argmax(predict) + 1
+    from tkinter import END, filedialog
+    if multimodal is None:
+        text.insert(END, "\nTrain or load the model first.\n")
+        return
+    folder = filedialog.askdirectory(initialdir="testImages")
+    parts = [
+        np.asarray([getTestFaceImage(folder + "/face.jpg")]),
+        np.asarray([getTestFingerImage(folder + "/finger.jpg")]),
+        np.asarray([getTestIrisImage(folder + "/iris.jpg")]),
+        np.asarray([getTestEarImage(folder + "/ear.jpg")]),
+        np.asarray([getTestPalmImage(folder + "/palm.jpg")]),
+    ]
+    test = fuse(*parts).astype("float32") / 255
+    predict = int(np.argmax(multimodal.predict(test))) + 1
 
-    finger = cv2.imread(filename+'/finger.jpg')
-    finger = cv2.resize(finger, (128,128))
-    face = cv2.imread(filename+'/face.jpg')
-    face = cv2.resize(face, (128,128))
-    iris = cv2.imread(filename+'/iris.jpg')
-    iris = cv2.resize(iris, (128,128))
-    ear = cv2.imread(filename+'/ear.jpg')
-    ear = cv2.resize(ear, (128,128))
-    palm = cv2.imread(filename+'/palm.jpg')
-    palm = cv2.resize(palm, (128,128))
-    img_list = []
-    img_list.append(face)
-    img_list.append(finger)
-    img_list.append(iris)
-    img_list.append(ear)
-    img_list.append(palm)
-    images = cv2.hconcat(img_list)
-    cv2.putText(images, "Multimodal Authenticate Person ID as : "+str(predict), (10, 25),  cv2.FONT_HERSHEY_SIMPLEX,0.7, (0, 0, 255), 2)
+    shown = [cv2.resize(cv2.imread(f"{folder}/{m}.jpg"), (128, 128)) for m in MODALITIES]
+    images = cv2.hconcat(shown)
+    cv2.putText(images, "Multimodal Authenticate Person ID as : " + str(predict), (10, 25),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
     cv2.imshow("Authentication Result", images)
-    cv2.waitKey(0)    
-    
+    cv2.waitKey(0)
+
 
 def close():
     main.destroy()
 
-font = ('times', 14, 'bold')
-title = Label(main, text='An Enhanced Multi-Modal Biometric Authentication')
-title.config(bg='DarkGoldenrod1', fg='black')  
-title.config(font=font)           
-title.config(height=3, width=120)       
-title.place(x=5,y=5)
 
-font1 = ('times', 13, 'bold')
-uploadButton = Button(main, text="Upload Multi-Modal Dataset", command=uploadDataset)
-uploadButton.place(x=50,y=100)
-uploadButton.config(font=font1)  
+def build_gui():
+    global main, text, pathlabel
+    import tkinter
+    from tkinter import Button, Label, Scrollbar, Text
 
-pathlabel = Label(main)
-pathlabel.config(bg='brown', fg='white')  
-pathlabel.config(font=font1)           
-pathlabel.place(x=560,y=100)
+    main = tkinter.Tk()
+    main.title("An Enhanced Multi-Modal Biometric Authentication")
+    main.geometry("1200x1200")
 
-preprocessButton = Button(main, text="Preprocess & KLDA Features Extraction", command=preprocessKLDAFeatures)
-preprocessButton.place(x=50,y=150)
-preprocessButton.config(font=font1)
+    title = Label(main, text="An Enhanced Multi-Modal Biometric Authentication")
+    title.config(bg="DarkGoldenrod1", fg="black", font=("times", 14, "bold"), height=3, width=120)
+    title.place(x=5, y=5)
 
-hybridMLButton = Button(main, text="Train Deep Learning Multi-Modal Model", command=trainModel)
-hybridMLButton.place(x=50,y=200)
-hybridMLButton.config(font=font1)
+    font1 = ("times", 13, "bold")
+    buttons = [
+        ("Upload Multi-Modal Dataset", uploadDataset, 100),
+        ("Preprocess & KLDA Features Extraction", preprocessKLDAFeatures, 150),
+        ("Train Deep Learning Multi-Modal Model", trainModel, 200),
+        ("Training Accuracy Graph", graph, 250),
+        ("Authentication from Multi-Modal Images", authentication, 300),
+        ("Exit", close, 350),
+    ]
+    for label, command, y in buttons:
+        b = Button(main, text=label, command=command)
+        b.place(x=50, y=y)
+        b.config(font=font1)
 
-snButton = Button(main, text="Training Accuracy Graph", command=graph)
-snButton.place(x=50,y=250)
-snButton.config(font=font1)
+    pathlabel = Label(main)
+    pathlabel.config(bg="brown", fg="white", font=font1)
+    pathlabel.place(x=560, y=100)
 
-snButton = Button(main, text="Authentication from Multi-Modal Images", command=authentication)
-snButton.place(x=50,y=300)
-snButton.config(font=font1)
+    text = Text(main, height=25, width=100)
+    scroll = Scrollbar(text)
+    text.configure(yscrollcommand=scroll.set)
+    text.place(x=400, y=150)
+    text.config(font=("times", 12, "bold"))
 
-graphButton = Button(main, text="Exit", command=close)
-graphButton.place(x=50,y=350)
-graphButton.config(font=font1)
-
-
-font1 = ('times', 12, 'bold')
-text=Text(main,height=25,width=100)
-scroll=Scrollbar(text)
-text.configure(yscrollcommand=scroll.set)
-text.place(x=400,y=150)
-text.config(font=font1)
+    main.config(bg="LightSteelBlue1")
+    return main
 
 
-main.config(bg='LightSteelBlue1')
-main.mainloop()
+if __name__ == "__main__":
+    build_gui().mainloop()
